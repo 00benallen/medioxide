@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{ TcpListener, TcpStream};
 use std::path::{ Path, PathBuf };
 use std::io;
 use std::io::prelude::*;
@@ -6,6 +6,11 @@ use std::thread;
 use std::fs::File;
 
 use failure::Fail;
+
+use httparse::{
+    EMPTY_HEADER,
+    Request
+};
 
 #[derive(Fail, Debug)]
 pub enum Error {
@@ -16,7 +21,10 @@ pub enum Error {
     CouldNotStartServer(#[fail(cause)] io::Error),
 
     #[fail(display = "Could not parse request because {}", _0)]
-    CouldNotParseRequest(#[fail(cause)] io::Error),
+    CouldNotParseRequest(#[fail(cause)] httparse::Error),
+
+    #[fail(display = "Could not read request from stream because {}", _0)]
+    CouldNotReadRequest(#[fail(cause)] io::Error),
 
     #[fail(display = "File {} doesn't exist", _0)]
     FileDoesntExist(String),
@@ -61,15 +69,11 @@ impl ImageServer {
         // println!("Listening for connections on port {}", port);
 
         for stream in listener.incoming() {
-            let mut image_folder = self.image_folder.clone();
             match stream {
                 Ok(stream) => {
+                    let image_folder = self.image_folder.clone();
                     thread::spawn(move || {
-                        let request = Request::new(stream.try_clone().unwrap()).unwrap();
-                        image_folder.push(request.file_name);
-
-                        let sender = FileSender::new(&image_folder).unwrap();
-                        sender.write_to_stream(stream).unwrap();
+                        ImageServer::handle_incoming(stream, image_folder).unwrap();
                     });
                 }
                 Err(e) => println!("Unable to connect: {}", e),
@@ -79,33 +83,38 @@ impl ImageServer {
 
     }
 
-}
-
-struct Request {
-    pub file_name: String,
-}
-
-impl Request {
-
-    pub fn new(mut stream: TcpStream) -> Result<Request> {
+    fn handle_incoming(stream: TcpStream, mut image_folder: PathBuf) -> Result<()> {
+        let mut headers = [EMPTY_HEADER; 16];
+        let mut req = Request::new(&mut headers);
         let mut buf = [0u8; 4096];
-        match stream.read(&mut buf) {
-            Ok(_) => {
-                let req_str = String::from_utf8_lossy(&buf);
-                let lines: Vec<&str> = req_str.split("\r\n").collect();
-                let tokens_in_first_line: Vec<&str> = lines[0].split(' ').collect();
-                let mut file_name = String::from(tokens_in_first_line[1]);
-                file_name.remove(0);  //remove leading slash
-                Ok(Request {
-                    file_name
-                })
-            },
-            Err(e) => {
-                Err(Error::CouldNotParseRequest(e))
-            }
-        }
+        req = parse_req_from_stream(stream.try_clone().unwrap(), req, &mut buf).unwrap();
+
+        let mut path = String::from(req.path.unwrap());
+        path.remove(0);
+        
+        image_folder.push(path);
+
+        let sender = FileSender::new(&image_folder).unwrap();
+        sender.write_to_stream(stream).unwrap();
+        Ok(())
     }
 
+}
+
+fn parse_req_from_stream<'a, 'b: 'a>(
+    mut stream: TcpStream, 
+    mut empty_req: Request<'a, 'b>, 
+    buf: &'b mut [u8]) -> Result<Request<'a, 'b>> {
+
+    match stream.read(buf) {
+        Ok(_) => {
+            empty_req.parse(buf).map_err(Error::CouldNotParseRequest)?;
+            Ok(empty_req)
+        },
+        Err(e) => {
+            Err(Error::CouldNotReadRequest(e))
+        }
+    }
 }
 
 struct FileSender {
